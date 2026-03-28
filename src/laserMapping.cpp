@@ -39,6 +39,7 @@
 #include <fstream>
 #include <csignal>
 #include <chrono>
+#include <filesystem>
 #include <unistd.h>
 #include <Python.h>
 #include <so3_math.h>
@@ -86,6 +87,8 @@ condition_variable sig_buffer;
 
 string root_dir = ROOT_DIR;
 string map_file_path, lid_topic, imu_topic;
+string odom_frame = "odom";
+string imu_frame = "imu";
 
 double res_mean_last = 0.05, total_residual = 0.0;
 double last_timestamp_lidar = 0, last_timestamp_imu = -1.0;
@@ -98,6 +101,18 @@ bool   point_selected_surf[100000] = {0};
 bool   lidar_pushed, flg_first_scan = true, flg_exit = false, flg_EKF_inited;
 bool   scan_pub_en = false, dense_pub_en = false, scan_body_pub_en = false;
 bool    is_first_lidar = true;
+
+/*** Gravity Alignment Variables ***/
+bool   enable_gravity_alignment = false;
+bool   is_gravity_aligned = false;
+M3D    R_gravity_aligned(Eye3d);
+V3D    gravity_accel_sum(Zero3d);
+int    gravity_accel_count = 0;
+double first_imu_stamp_for_gravity = -1.0;
+bool   gravity_collection_started = false;
+bool   gravity_collection_done = false;
+double imu_collection_duration_s = 1.0;
+V3D    heading_lidar(1.0, 0.0, 0.0);
 
 vector<vector<int>>  pointSearchInd_surf; 
 vector<BoxPointType> cub_needrm;
@@ -146,7 +161,7 @@ shared_ptr<ImuProcess> p_imu(new ImuProcess());
 void SigHandle(int sig)
 {
     flg_exit = true;
-    std::cout << "catch sig %d" << sig << std::endl;
+    RCLCPP_INFO(rclcpp::get_logger("fastlio"), "catch sig %d", sig);
     sig_buffer.notify_all();
     rclcpp::shutdown();
 }
@@ -165,6 +180,38 @@ inline void dump_lio_state_to_log(FILE *fp)
     fprintf(fp, "%lf %lf %lf ", state_point.grav[0], state_point.grav[1], state_point.grav[2]); // Bias_a  
     fprintf(fp, "\r\n");  
     fflush(fp);
+}
+
+// Outputs rotation matrix R such that R * g_a = g_b (ported from spark-fast-lio)
+M3D computeRelativeRotation(const Eigen::Vector3d &g_a, const Eigen::Vector3d &g_b) {
+    Eigen::Vector3d g_a_norm = g_a.normalized();
+    Eigen::Vector3d g_b_norm = g_b.normalized();
+
+    Eigen::Vector3d axis = g_a_norm.cross(g_b_norm);
+    double cos_theta     = g_a_norm.dot(g_b_norm);
+
+    if (std::fabs(1.0 - cos_theta) < 1e-3) {
+        return Eigen::Matrix3d::Identity();
+    }
+
+    // Degenerate condition a = -b
+    if (std::fabs(1.0 + cos_theta) < 1e-3) {
+        Eigen::Vector3d perturbed = g_a_norm + Eigen::Vector3d(1, 2, 3);
+        axis                      = g_a_norm.cross(perturbed);
+
+        if (axis.norm() < 1e-6) {
+            perturbed = g_a_norm + Eigen::Vector3d(3, 2, 1);
+            axis      = g_a_norm.cross(perturbed);
+        }
+
+        axis.normalize();
+        return Eigen::AngleAxisd(M_PI, axis).toRotationMatrix();
+    } else {
+        axis.normalize();
+        double theta = std::acos(cos_theta);
+        Eigen::Quaterniond q(Eigen::AngleAxisd(theta, axis));
+        return q.toRotationMatrix();
+    }
 }
 
 void pointBodyToWorld_ikfom(PointType const * const pi, PointType * const po, state_ikfom &s)
@@ -227,7 +274,6 @@ void points_cache_collect()
 {
     PointVector points_history;
     ikdtree.acquire_removed_points(points_history);
-    // for (int i = 0; i < points_history.size(); i++) _featsArray->push_back(points_history[i]);
 }
 
 BoxPointType LocalMap_Points;
@@ -288,7 +334,7 @@ void standard_pcl_cbk(const sensor_msgs::msg::PointCloud2::UniquePtr msg)
     double preprocess_start_time = omp_get_wtime();
     if (!is_first_lidar && cur_time < last_timestamp_lidar)
     {
-        std::cerr << "lidar loop back, clear buffer" << std::endl;
+        RCLCPP_WARN(rclcpp::get_logger("fastlio"), "lidar loop back, clear buffer");
         lidar_buffer.clear();
     }
     if (is_first_lidar)
@@ -316,7 +362,7 @@ void livox_pcl_cbk(const livox_ros_driver2::msg::CustomMsg::UniquePtr msg)
     scan_count ++;
     if (!is_first_lidar && cur_time < last_timestamp_lidar)
     {
-        std::cerr << "lidar loop back, clear buffer" << std::endl;
+        RCLCPP_WARN(rclcpp::get_logger("fastlio"), "lidar loop back, clear buffer");
         lidar_buffer.clear();
     }
     if(is_first_lidar)
@@ -363,11 +409,35 @@ void imu_cbk(const sensor_msgs::msg::Imu::UniquePtr msg_in)
 
     double timestamp = get_time_sec(msg->header.stamp);
 
+    /*** Gravity alignment: accumulate raw IMU accelerations ***/
+    if (enable_gravity_alignment && !gravity_collection_done)
+    {
+        if (!gravity_collection_started)
+        {
+            first_imu_stamp_for_gravity = timestamp;
+            gravity_collection_started = true;
+        }
+        double elapsed = timestamp - first_imu_stamp_for_gravity;
+        if (elapsed < imu_collection_duration_s)
+        {
+            const auto &a = msg_in->linear_acceleration;
+            gravity_accel_sum += V3D(a.x, a.y, a.z);
+            gravity_accel_count++;
+        }
+        else if (gravity_accel_count > 0)
+        {
+            gravity_collection_done = true;
+            RCLCPP_INFO(rclcpp::get_logger("fastlio"),
+                        "Gravity alignment: collected %d IMU samples over %.2f s",
+                        gravity_accel_count, elapsed);
+        }
+    }
+
     mtx_buffer.lock();
 
     if (timestamp < last_timestamp_imu)
     {
-        std::cerr << "lidar loop back, clear buffer" << std::endl;
+        RCLCPP_WARN(rclcpp::get_logger("fastlio"), "lidar loop back, clear buffer");
         imu_buffer.clear();
     }
 
@@ -394,7 +464,7 @@ bool sync_packages(MeasureGroup &meas)
         if (meas.lidar->points.size() <= 1) // time too little
         {
             lidar_end_time = meas.lidar_beg_time + lidar_mean_scantime;
-            std::cerr << "Too few input point cloud!\n";
+            RCLCPP_WARN(rclcpp::get_logger("fastlio"), "Too few input point cloud!");
         }
         else if (meas.lidar->points.back().curvature / double(1000) < 0.5 * lidar_mean_scantime)
         {
@@ -499,48 +569,62 @@ void publish_frame_world(rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::Share
         {
             RGBpointBodyToWorld(&laserCloudFullRes->points[i], \
                                 &laserCloudWorld->points[i]);
+            // Apply gravity alignment to world-frame points
+            V3D p(laserCloudWorld->points[i].x, laserCloudWorld->points[i].y, laserCloudWorld->points[i].z);
+            p = R_gravity_aligned * p;
+            laserCloudWorld->points[i].x = p(0);
+            laserCloudWorld->points[i].y = p(1);
+            laserCloudWorld->points[i].z = p(2);
         }
 
         sensor_msgs::msg::PointCloud2 laserCloudmsg;
         pcl::toROSMsg(*laserCloudWorld, laserCloudmsg);
-        // laserCloudmsg.header.stamp = ros::Time().fromSec(lidar_end_time);
         laserCloudmsg.header.stamp = get_ros_time(lidar_end_time);
-        laserCloudmsg.header.frame_id = "camera_init";
+        laserCloudmsg.header.frame_id = odom_frame;
         pubLaserCloudFull->publish(laserCloudmsg);
         publish_count -= PUBFRAME_PERIOD;
     }
 
     /**************** save map ****************/
-    /* 1. make sure you have enough memories
-    /* 2. noted that pcd save will influence the real-time performences **/
-    /*
     if (pcd_save_en)
     {
+        // Always use full undistorted cloud for PCD saving, regardless of dense_pub_en
         int size = feats_undistort->points.size();
-        PointCloudXYZI::Ptr laserCloudWorld( \
-                        new PointCloudXYZI(size, 1));
+        PointCloudXYZI::Ptr laserCloudWorld(new PointCloudXYZI(size, 1));
 
         for (int i = 0; i < size; i++)
         {
-            RGBpointBodyToWorld(&feats_undistort->points[i], \
+            RGBpointBodyToWorld(&feats_undistort->points[i],
                                 &laserCloudWorld->points[i]);
+            // Apply gravity alignment to saved points (matching spark-fast-lio)
+            V3D p(laserCloudWorld->points[i].x, laserCloudWorld->points[i].y, laserCloudWorld->points[i].z);
+            p = R_gravity_aligned * p;
+            laserCloudWorld->points[i].x = p(0);
+            laserCloudWorld->points[i].y = p(1);
+            laserCloudWorld->points[i].z = p(2);
         }
-        *pcl_wait_save += *laserCloudWorld;
+
+        if (pcd_save_interval > 0)
+        {
+            *pcl_wait_save += *laserCloudWorld;
+        }
 
         static int scan_wait_num = 0;
-        scan_wait_num ++;
-        if (pcl_wait_save->size() > 0 && pcd_save_interval > 0  && scan_wait_num >= pcd_save_interval)
+        scan_wait_num++;
+        if (pcl_wait_save->size() > 0 && pcd_save_interval > 0
+            && scan_wait_num >= pcd_save_interval)
         {
-            pcd_index ++;
-            string all_points_dir(string(string(ROOT_DIR) + "PCD/scans_") + to_string(pcd_index) + string(".pcd"));
+            pcd_index++;
+            std::string pcd_dir = std::string(ROOT_DIR) + "PCD/";
+            std::filesystem::create_directories(pcd_dir);
+            std::string all_points_dir(pcd_dir + "scans_" + std::to_string(pcd_index) + ".pcd");
             pcl::PCDWriter pcd_writer;
-            cout << "current scan saved to /PCD/" << all_points_dir << endl;
+            RCLCPP_INFO(rclcpp::get_logger("fastlio"), "Current scan saved to %s", all_points_dir.c_str());
             pcd_writer.writeBinary(all_points_dir, *pcl_wait_save);
             pcl_wait_save->clear();
             scan_wait_num = 0;
         }
     }
-    */
 }
 
 void publish_frame_body(rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pubLaserCloudFull_body)
@@ -557,7 +641,7 @@ void publish_frame_body(rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::Shared
     sensor_msgs::msg::PointCloud2 laserCloudmsg;
     pcl::toROSMsg(*laserCloudIMUBody, laserCloudmsg);
     laserCloudmsg.header.stamp = get_ros_time(lidar_end_time);
-    laserCloudmsg.header.frame_id = "body";
+    laserCloudmsg.header.frame_id = imu_frame;
     pubLaserCloudFull_body->publish(laserCloudmsg);
     publish_count -= PUBFRAME_PERIOD;
 }
@@ -570,11 +654,16 @@ void publish_effect_world(rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::Shar
     {
         RGBpointBodyToWorld(&laserCloudOri->points[i], \
                             &laserCloudWorld->points[i]);
+        V3D p(laserCloudWorld->points[i].x, laserCloudWorld->points[i].y, laserCloudWorld->points[i].z);
+        p = R_gravity_aligned * p;
+        laserCloudWorld->points[i].x = p(0);
+        laserCloudWorld->points[i].y = p(1);
+        laserCloudWorld->points[i].z = p(2);
     }
     sensor_msgs::msg::PointCloud2 laserCloudFullRes3;
     pcl::toROSMsg(*laserCloudWorld, laserCloudFullRes3);
     laserCloudFullRes3.header.stamp = get_ros_time(lidar_end_time);
-    laserCloudFullRes3.header.frame_id = "camera_init";
+    laserCloudFullRes3.header.frame_id = odom_frame;
     pubLaserCloudEffect->publish(laserCloudFullRes3);
 }
 
@@ -594,41 +683,31 @@ void publish_map(rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pub
 
     sensor_msgs::msg::PointCloud2 laserCloudmsg;
     pcl::toROSMsg(*pcl_wait_pub, laserCloudmsg);
-    // laserCloudmsg.header.stamp = ros::Time().fromSec(lidar_end_time);
     laserCloudmsg.header.stamp = get_ros_time(lidar_end_time);
-    laserCloudmsg.header.frame_id = "camera_init";
+    laserCloudmsg.header.frame_id = odom_frame;
     pubLaserCloudMap->publish(laserCloudmsg);
-
-    // sensor_msgs::msg::PointCloud2 laserCloudMap;
-    // pcl::toROSMsg(*featsFromMap, laserCloudMap);
-    // laserCloudMap.header.stamp = get_ros_time(lidar_end_time);
-    // laserCloudMap.header.frame_id = "camera_init";
-    // pubLaserCloudMap->publish(laserCloudMap);
-}
-
-void save_to_pcd()
-{
-    pcl::PCDWriter pcd_writer;
-    pcd_writer.writeBinary(map_file_path, *pcl_wait_pub);
 }
 
 template<typename T>
 void set_posestamp(T & out)
 {
-    out.pose.position.x = state_point.pos(0);
-    out.pose.position.y = state_point.pos(1);
-    out.pose.position.z = state_point.pos(2);
-    out.pose.orientation.x = geoQuat.x;
-    out.pose.orientation.y = geoQuat.y;
-    out.pose.orientation.z = geoQuat.z;
-    out.pose.orientation.w = geoQuat.w;
-    
+    V3D aligned_pos = R_gravity_aligned * state_point.pos;
+    M3D aligned_rot = R_gravity_aligned * state_point.rot.toRotationMatrix();
+    Eigen::Quaterniond q_aligned(aligned_rot);
+
+    out.pose.position.x = aligned_pos(0);
+    out.pose.position.y = aligned_pos(1);
+    out.pose.position.z = aligned_pos(2);
+    out.pose.orientation.x = q_aligned.x();
+    out.pose.orientation.y = q_aligned.y();
+    out.pose.orientation.z = q_aligned.z();
+    out.pose.orientation.w = q_aligned.w();
 }
 
 void publish_odometry(const rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr pubOdomAftMapped, std::unique_ptr<tf2_ros::TransformBroadcaster> & tf_br)
 {
-    odomAftMapped.header.frame_id = "camera_init";
-    odomAftMapped.child_frame_id = "body";
+    odomAftMapped.header.frame_id = odom_frame;
+    odomAftMapped.child_frame_id = imu_frame;
     odomAftMapped.header.stamp = get_ros_time(lidar_end_time);
     set_posestamp(odomAftMapped.pose);
     pubOdomAftMapped->publish(odomAftMapped);
@@ -645,8 +724,8 @@ void publish_odometry(const rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPt
     }
 
     geometry_msgs::msg::TransformStamped trans;
-    trans.header.frame_id = "camera_init";
-    trans.child_frame_id = "body";
+    trans.header.frame_id = odom_frame;
+    trans.child_frame_id = imu_frame;
     trans.header.stamp = get_ros_time(lidar_end_time);
     trans.transform.translation.x = odomAftMapped.pose.pose.position.x;
     trans.transform.translation.y = odomAftMapped.pose.pose.position.y;
@@ -661,8 +740,8 @@ void publish_odometry(const rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPt
 void publish_path(rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr pubPath)
 {
     set_posestamp(msg_body_pose);
-    msg_body_pose.header.stamp = get_ros_time(lidar_end_time); // ros::Time().fromSec(lidar_end_time);
-    msg_body_pose.header.frame_id = "camera_init";
+    msg_body_pose.header.stamp = get_ros_time(lidar_end_time);
+    msg_body_pose.header.frame_id = odom_frame;
 
     /*** if path is too large, the rvis will crash ***/
     static int jjj = 0;
@@ -747,7 +826,7 @@ void h_share_model(state_ikfom &s, esekfom::dyn_share_datastruct<double> &ekfom_
     if (effct_feat_num < 1)
     {
         ekfom_data.valid = false;
-        std::cerr << "No Effective Points!" << std::endl;
+        RCLCPP_WARN(rclcpp::get_logger("fastlio"), "No Effective Points!");
         // ROS_WARN("No Effective Points! \n");
         return;
     }
@@ -808,6 +887,7 @@ public:
         this->declare_parameter<string>("map_file_path", "");
         this->declare_parameter<string>("common.lid_topic", "/livox/lidar");
         this->declare_parameter<string>("common.imu_topic", "/livox/imu");
+        this->declare_parameter<string>("common.odom_frame", "odom");
         this->declare_parameter<bool>("common.time_sync_en", false);
         this->declare_parameter<double>("common.time_offset_lidar_to_imu", 0.0);
         this->declare_parameter<double>("filter_size_corner", 0.5);
@@ -833,6 +913,9 @@ public:
         this->declare_parameter<int>("pcd_save.interval", -1);
         this->declare_parameter<vector<double>>("mapping.extrinsic_T", vector<double>());
         this->declare_parameter<vector<double>>("mapping.extrinsic_R", vector<double>());
+        this->declare_parameter<bool>("gravity_alignment.enable_gravity_alignment", false);
+        this->declare_parameter<double>("gravity_alignment.imu_collection_duration", 1.0);
+        this->declare_parameter<vector<double>>("gravity_alignment.heading_lidar", vector<double>({1.0, 0.0, 0.0}));
 
         this->get_parameter_or<bool>("publish.path_en", path_en, true);
         this->get_parameter_or<bool>("publish.effect_map_en", effect_pub_en, false);
@@ -844,6 +927,7 @@ public:
         this->get_parameter_or<string>("map_file_path", map_file_path, "");
         this->get_parameter_or<string>("common.lid_topic", lid_topic, "/livox/lidar");
         this->get_parameter_or<string>("common.imu_topic", imu_topic,"/livox/imu");
+        this->get_parameter_or<string>("common.odom_frame", odom_frame, "odom");
         this->get_parameter_or<bool>("common.time_sync_en", time_sync_en, false);
         this->get_parameter_or<double>("common.time_offset_lidar_to_imu", time_diff_lidar_to_imu, 0.0);
         this->get_parameter_or<double>("filter_size_corner",filter_size_corner_min,0.5);
@@ -869,16 +953,24 @@ public:
         this->get_parameter_or<int>("pcd_save.interval", pcd_save_interval, -1);
         this->get_parameter_or<vector<double>>("mapping.extrinsic_T", extrinT, vector<double>());
         this->get_parameter_or<vector<double>>("mapping.extrinsic_R", extrinR, vector<double>());
+        this->get_parameter_or<bool>("gravity_alignment.enable_gravity_alignment", enable_gravity_alignment, false);
+        this->get_parameter_or<double>("gravity_alignment.imu_collection_duration", imu_collection_duration_s, 1.0);
+        {
+            vector<double> heading_lidar_vec;
+            this->get_parameter_or<vector<double>>("gravity_alignment.heading_lidar", heading_lidar_vec, vector<double>({1.0, 0.0, 0.0}));
+            if (heading_lidar_vec.size() == 3) {
+                heading_lidar = V3D(heading_lidar_vec[0], heading_lidar_vec[1], heading_lidar_vec[2]);
+            }
+        }
+        if (enable_gravity_alignment) {
+            RCLCPP_INFO(this->get_logger(), "Gravity alignment enabled (collection duration: %.2f s, heading_lidar: [%.2f, %.2f, %.2f])",
+                        imu_collection_duration_s, heading_lidar(0), heading_lidar(1), heading_lidar(2));
+        }
 
         RCLCPP_INFO(this->get_logger(), "p_pre->lidar_type %d", p_pre->lidar_type);
 
         path.header.stamp = this->get_clock()->now();
-        path.header.frame_id ="camera_init";
-
-        // /*** variables definition ***/
-        // int effect_feat_num = 0, frame_num = 0;
-        // double deltaT, deltaR, aver_time_consu = 0, aver_time_icp = 0, aver_time_match = 0, aver_time_incre = 0, aver_time_solve = 0, aver_time_const_H_time = 0;
-        // bool flg_EKF_converged, EKF_stop_flg = 0;
+        path.header.frame_id = odom_frame;
 
         FOV_DEG = (fov_deg + 10.0) > 179.9 ? 179.9 : (fov_deg + 10.0);
         HALF_FOV_COS = cos((FOV_DEG) * 0.5 * PI_M / 180.0);
@@ -904,18 +996,15 @@ public:
         kf.init_dyn_share(get_f, df_dx, df_dw, h_share_model, NUM_MAX_ITERATIONS, epsi);
 
         /*** debug record ***/
-        // FILE *fp;
         string pos_log_dir = root_dir + "/Log/pos_log.txt";
         fp = fopen(pos_log_dir.c_str(),"w");
-
-        // ofstream fout_pre, fout_out, fout_dbg;
         fout_pre.open(DEBUG_FILE_DIR("mat_pre.txt"),ios::out);
         fout_out.open(DEBUG_FILE_DIR("mat_out.txt"),ios::out);
         fout_dbg.open(DEBUG_FILE_DIR("dbg.txt"),ios::out);
         if (fout_pre && fout_out)
-            cout << "~~~~"<<ROOT_DIR<<" file opened" << endl;
+            RCLCPP_INFO(this->get_logger(), "~~~~ %s file opened", ROOT_DIR);
         else
-            cout << "~~~~"<<ROOT_DIR<<" doesn't exist" << endl;
+            RCLCPP_WARN(this->get_logger(), "~~~~ %s doesn't exist", ROOT_DIR);
 
         /*** ROS subscribe initialization ***/
         if (p_pre->lidar_type == AVIA)
@@ -930,8 +1019,8 @@ public:
         pubLaserCloudFull_ = this->create_publisher<sensor_msgs::msg::PointCloud2>("/cloud_registered", 20);
         pubLaserCloudFull_body_ = this->create_publisher<sensor_msgs::msg::PointCloud2>("/cloud_registered_body", 20);
         pubLaserCloudEffect_ = this->create_publisher<sensor_msgs::msg::PointCloud2>("/cloud_effected", 20);
-        pubLaserCloudMap_ = this->create_publisher<sensor_msgs::msg::PointCloud2>("/Laser_map", 20);
-        pubOdomAftMapped_ = this->create_publisher<nav_msgs::msg::Odometry>("/Odometry", 20);
+        pubLaserCloudMap_ = this->create_publisher<sensor_msgs::msg::PointCloud2>("/laser_map", 20);
+        pubOdomAftMapped_ = this->create_publisher<nav_msgs::msg::Odometry>("/odometry", 20);
         pubPath_ = this->create_publisher<nav_msgs::msg::Path>("/path", 20);
         tf_broadcaster_ = std::make_unique<tf2_ros::TransformBroadcaster>(*this);
 
@@ -1031,14 +1120,6 @@ private:
             fout_pre<<setw(20)<<Measures.lidar_beg_time - first_lidar_time<<" "<<euler_cur.transpose()<<" "<< state_point.pos.transpose()<<" "<<ext_euler.transpose() << " "<<state_point.offset_T_L_I.transpose()<< " " << state_point.vel.transpose() \
             <<" "<<state_point.bg.transpose()<<" "<<state_point.ba.transpose()<<" "<<state_point.grav<< endl;
 
-            if(0) // If you need to see map point, change to "if(1)"
-            {
-                PointVector ().swap(ikdtree.PCL_Storage);
-                ikdtree.flatten(ikdtree.Root_Node, ikdtree.PCL_Storage, NOT_RECORD);
-                featsFromMap->clear();
-                featsFromMap->points = ikdtree.PCL_Storage;
-            }
-
             pointSearchInd_surf.resize(feats_down_size);
             Nearest_Points.resize(feats_down_size);
             int  rematch_num = 0;
@@ -1060,19 +1141,48 @@ private:
 
             double t_update_end = omp_get_wtime();
 
-            /******* Publish odometry *******/
-            publish_odometry(pubOdomAftMapped_, tf_broadcaster_);
-
-            /*** add the feature points to map kdtree ***/
+            /*** add the feature points to map kdtree (uses unaligned state) ***/
             t3 = omp_get_wtime();
             map_incremental();
             t5 = omp_get_wtime();
-            
-            /******* Publish points *******/
-            if (path_en)                         publish_path(pubPath_);
-            if (scan_pub_en)      publish_frame_world(pubLaserCloudFull_);
-            if (scan_pub_en && scan_body_pub_en) publish_frame_body(pubLaserCloudFull_body_);
-            if (effect_pub_en) publish_effect_world(pubLaserCloudEffect_);
+
+            /*** Gravity alignment: compute alignment transform once ready ***/
+            if (enable_gravity_alignment && !is_gravity_aligned && gravity_collection_done)
+            {
+                V3D avg_gravity_imu = -(gravity_accel_sum / static_cast<double>(gravity_accel_count));
+                V3D g_desired(0, 0, -G_m_s2);
+                R_gravity_aligned = computeRelativeRotation(avg_gravity_imu, g_desired);
+
+                // Zero yaw: transform heading from lidar frame to gravity-aligned odom frame
+                V3D heading_odom = R_gravity_aligned
+                                   * state_point.rot.toRotationMatrix()
+                                   * state_point.offset_R_L_I.toRotationMatrix()
+                                   * heading_lidar;
+                double yaw = std::atan2(heading_odom.y(), heading_odom.x());
+                M3D R_yaw = Eigen::AngleAxisd(yaw, V3D(0, 0, 1)).toRotationMatrix();
+                R_gravity_aligned = R_yaw * R_gravity_aligned;
+
+                is_gravity_aligned = true;
+                RCLCPP_INFO(this->get_logger(), "Gravity alignment computed.");
+            }
+
+            /*** Gate publishing until gravity alignment is done ***/
+            if (enable_gravity_alignment && !is_gravity_aligned)
+            {
+                RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
+                    "Gravity alignment enabled but not yet completed. Waiting...");
+            }
+            else
+            {
+                /******* Publish odometry *******/
+                publish_odometry(pubOdomAftMapped_, tf_broadcaster_);
+
+                /******* Publish points *******/
+                if (path_en)                         publish_path(pubPath_);
+                if (scan_pub_en || pcd_save_en)  publish_frame_world(pubLaserCloudFull_);
+                if (scan_pub_en && scan_body_pub_en) publish_frame_body(pubLaserCloudFull_body_);
+                if (effect_pub_en) publish_effect_world(pubLaserCloudEffect_);
+            }
             // if (map_pub_en) publish_map(pubLaserCloudMap_);
 
             /*** Debug variables ***/
@@ -1114,17 +1224,23 @@ private:
 
     void map_save_callback(std_srvs::srv::Trigger::Request::ConstSharedPtr req, std_srvs::srv::Trigger::Response::SharedPtr res)
     {
-        RCLCPP_INFO(this->get_logger(), "Saving map to %s...", map_file_path.c_str());
-        if (pcd_save_en)
+        if (pcd_save_en && pcl_wait_save->size() > 0)
         {
-            save_to_pcd();
+            pcd_index++;
+            std::string pcd_dir = std::string(ROOT_DIR) + "PCD/";
+            std::filesystem::create_directories(pcd_dir);
+            std::string all_points_dir(pcd_dir + "scans_" + std::to_string(pcd_index) + ".pcd");
+            pcl::PCDWriter pcd_writer;
+            pcd_writer.writeBinary(all_points_dir, *pcl_wait_save);
+            pcl_wait_save->clear();
+            RCLCPP_INFO(this->get_logger(), "Map saved to %s", all_points_dir.c_str());
             res->success = true;
-            res->message = "Map saved.";
+            res->message = "Map saved to " + all_points_dir;
         }
         else
         {
             res->success = false;
-            res->message = "Map save disabled.";
+            res->message = pcd_save_en ? "No accumulated points to save." : "PCD save disabled.";
         }
     }
 
@@ -1164,15 +1280,15 @@ int main(int argc, char** argv)
 
     if (rclcpp::ok())
         rclcpp::shutdown();
-    /**************** save map ****************/
-    /* 1. make sure you have enough memories
-    /* 2. pcd save will largely influence the real-time performences **/
+    /**************** save remaining accumulated points ****************/
     if (pcl_wait_save->size() > 0 && pcd_save_en)
     {
-        string file_name = string("scans.pcd");
-        string all_points_dir(string(string(ROOT_DIR) + "PCD/") + file_name);
+        pcd_index++;
+        std::string pcd_dir = std::string(ROOT_DIR) + "PCD/";
+        std::filesystem::create_directories(pcd_dir);
+        std::string all_points_dir(pcd_dir + "scans_" + std::to_string(pcd_index) + ".pcd");
         pcl::PCDWriter pcd_writer;
-        cout << "current scan saved to /PCD/" << file_name<<endl;
+        RCLCPP_INFO(rclcpp::get_logger("fastlio"), "Shutdown save to %s", all_points_dir.c_str());
         pcd_writer.writeBinary(all_points_dir, *pcl_wait_save);
     }
 
