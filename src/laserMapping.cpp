@@ -1159,7 +1159,7 @@ private:
                                    * state_point.offset_R_L_I.toRotationMatrix()
                                    * heading_lidar;
                 double yaw = std::atan2(heading_odom.y(), heading_odom.x());
-                M3D R_yaw = Eigen::AngleAxisd(yaw, V3D(0, 0, 1)).toRotationMatrix();
+                M3D R_yaw = Eigen::AngleAxisd(yaw, V3D(0, 0, -1)).toRotationMatrix();
                 R_gravity_aligned = R_yaw * R_gravity_aligned;
 
                 is_gravity_aligned = true;
