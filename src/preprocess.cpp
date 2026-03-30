@@ -85,6 +85,10 @@ void Preprocess::process(const sensor_msgs::msg::PointCloud2::UniquePtr &msg, Po
       mid360_handler(msg);
       break;
 
+    case HESAI:
+      hesai_handler(msg);
+      break;
+
     default:
       default_handler(msg);
       break;
@@ -550,6 +554,45 @@ void Preprocess::mid360_handler(const sensor_msgs::msg::PointCloud2::UniquePtr &
     time_last[layer] = added_pt.curvature;
 
     if (added_pt.x * added_pt.x + added_pt.y * added_pt.y + added_pt.z * added_pt.z > (blind * blind))
+    {
+      pl_surf.push_back(std::move(added_pt));
+    }
+  }
+}
+
+void Preprocess::hesai_handler(const sensor_msgs::msg::PointCloud2::UniquePtr &msg)
+{
+  pl_surf.clear();
+  pl_corn.clear();
+  pl_full.clear();
+
+  pcl::PointCloud<hesai_ros::Point> pl_orig;
+  pcl::fromROSMsg(*msg, pl_orig);
+  int plsize = pl_orig.points.size();
+  if (plsize == 0)
+    return;
+  pl_surf.reserve(plsize);
+
+  double first_timestamp = pl_orig.points[0].timestamp;
+
+  for (int i = 0; i < plsize; i++)
+  {
+    auto &pt = pl_orig.points[i];
+    if (pt.x * pt.x + pt.y * pt.y + pt.z * pt.z < (blind * blind))
+      continue;
+
+    PointType added_pt;
+    added_pt.normal_x  = 0;
+    added_pt.normal_y  = 0;
+    added_pt.normal_z  = 0;
+    added_pt.x         = pt.x;
+    added_pt.y         = pt.y;
+    added_pt.z         = pt.z;
+    added_pt.intensity = pt.intensity;
+    // curvature stores per-point time offset from scan start, in milliseconds
+    added_pt.curvature = (pt.timestamp - first_timestamp) * 1000.0;
+
+    if (i % point_filter_num == 0)
     {
       pl_surf.push_back(std::move(added_pt));
     }
