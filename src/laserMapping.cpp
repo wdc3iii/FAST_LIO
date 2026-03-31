@@ -1222,7 +1222,7 @@ private:
         if (map_pub_en) publish_map(pubLaserCloudMap_);
     }
 
-    void map_save_callback(std_srvs::srv::Trigger::Request::ConstSharedPtr req, std_srvs::srv::Trigger::Response::SharedPtr res)
+    void map_save_callback(std_srvs::srv::Trigger::Request::SharedPtr req, std_srvs::srv::Trigger::Response::SharedPtr res)
     {
         if (pcd_save_en && pcl_wait_save->size() > 0)
         {
